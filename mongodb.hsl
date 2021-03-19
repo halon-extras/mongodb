@@ -1,0 +1,348 @@
+class MongoDB
+{
+	private $address = none;
+	private $port = none;
+	private $timeout = none;
+	private $socket = none;
+	private $database = none;
+	private $requestID = 0;
+
+	constructor($address, $database, $opts = [])
+	{
+		$this->address = $address;
+		$this->database = $database;
+		$this->port = $opts["port"] ?? 27017;
+		$this->timeout = $opts["timeout"] ?? 30;
+	}
+
+	function connect()
+	{
+		$this->socket = Socket(Socket::AF($this->address), "SOCK_STREAM");
+		if (!$this->socket->settimeout($this->timeout)) return;
+		if (!$this->socket->connect($this->address, $this->port)) return;
+
+		return true;
+	}
+
+	function find($query = none, $fieldSelector = none, $offset = 0, $limit = 0)
+	{
+		$requestID = $this->requestID += 1;
+		$responseTo = 0xffffffff;
+		$opCode = 2004; // OP_QUERY
+
+		$flags = 0;
+		$fullCollectionName = $this->database;
+		$numberToSkip = $offset;
+		$numberToReturn = $limit;
+		$query = $this->bson_encode($query);
+
+		$returnFieldsSelector = "";
+		if ($fieldSelector != none)
+			$returnFieldsSelector = $this->bson_encode($fieldSelector);
+
+		$data = pack("VVVVZ*VVa*a*",
+				$requestID,
+				$responseTo,
+				$opCode,
+				$flags,
+				$fullCollectionName,
+				$numberToSkip,
+				$numberToReturn,
+				$query,
+				$returnFieldsSelector);
+		$this->socket->send(pack("V", 4 + length($data)) . $data);
+
+		$result = [];
+		forever
+		{
+			[$len] = unpack("V", $this->socket->recv(4, "MSG_WAITALL"));
+			if ($len == none or $len <= 4)
+				return none;
+			$len -= 4;
+
+			$data = "";
+			while ($len > 0)
+			{
+				$chunk = $this->socket->recv($len > 65535 ? 65535 : $len);
+				if ($chunk == none)
+					return none;
+				$data .= $chunk;
+				$len -= length($chunk);
+				$chunk = "";
+			}
+
+			$i = 0;
+			[
+				$RrequestID,
+				$RresponseTo,
+				$RopCode
+			] = unpack("VVV", $data, $i);
+			$i += 12;
+
+			if ($RresponseTo != $requestID)
+				return none;
+
+			if ($RopCode != 1) // OP_REPLY
+				return none;
+
+			[
+				$responseFlags,
+				$cursorID1,
+				$cursorID2,
+				$startingFrom,
+				$numberReturned
+			] = unpack("VVVVV", $data, $i);
+			$i += 20;
+
+			while ($i < length($data))
+			{
+				$l = unpack("V", $data, $i)[0];
+				$result[] = $this->bson_decode($data, $i);
+				$i += $l;
+			}
+
+			if ($cursorID1 == 0 and $cursorID2 == 0)
+				break;
+
+			if ($numberToReturn < 0)
+				break;
+			if ($numberToReturn == 0)
+				$limit = $numberReturned;
+			else
+				$limit -= $numberReturned;
+			if ($limit <= 0)
+				break;
+
+			$opCode = 2005;
+
+			$data = pack("VVVVZ*VVV",
+					$requestID,
+					$responseTo,
+					$opCode,
+					0,
+					$fullCollectionName,
+					$limit,
+					$cursorID1,
+					$cursorID2);
+			$this->socket->send(pack("V", 4 + length($data)) . $data);
+		}
+
+		return $result;
+	}
+
+	function disconnect()
+	{
+		if (!$this->socket)
+			return;
+
+		$this->socket->shutdown("SHUT_RDWR");
+		$this->socket->close();
+	}
+
+	// http://bsonspec.org/spec.html
+	private function bson_decode($data, $i)
+	{
+		[$l] = unpack("V", $data, $i);
+		$stack = [["output" => [], "i" => $i + 4, "l" => $i + $l]];
+
+		forever
+		{
+			["output" => $output, "i" => $i, "l" => $l, "key" => $key] = $stack[-1:][0];
+
+			if ($i == $l)
+			{
+				if (length($stack) == 1)
+					return $output;
+				$last = $stack[-1:][0];
+				$stack = $stack[:-1];
+				$head = $stack[-1:][0];
+				if ($head["key"] != none)
+				{
+					$head["output"][$head["key"]] = $last["output"];
+					unset($head["key"]);
+
+					$stack = $stack[:-1];
+					$stack[] = $head;
+				}
+				continue;
+			}
+
+			$break = false;
+			while (!$break and $i < $l)
+			{
+				[$type] = unpack("c", $data, $i);
+				$i += 1;
+
+				if ($type == 0)
+				{
+					$stack = $stack[:-1];
+					$stack[] = ["output" => $output, "i" => $i, "l" => $l];
+					break;
+				}
+
+				[$key] = unpack("Z*", $data, $i);
+				$i += length($key) + 1;
+
+				switch ($type)
+				{
+					case 0x01:
+						$output[$key] = unpack("e", $data, $i)[0];
+						$i += 8;
+						break;
+					case 0x02:
+						[$length] = unpack("V", $data, $i);
+						$i += 4;
+						$output[$key] = $data[$i:$i + $length - 1];
+						$i += $length;
+						break;
+					case 0x03:
+					case 0x04:
+						[$length] = unpack("V", $data, $i);
+						$stack = $stack[:-1];
+						$stack[] = ["output" => $output, "i" => $i + $length, "l" => $l, "key" => $key];
+						$stack[] = ["output" => [], "i" => $i + 4, "l" => $i + $length];
+						$break = true;
+						break;
+					case 0x05:
+						[$length] = unpack("V", $data, $i);
+						$i += 4 + $length + 1;
+						echo "unsupported BSON type (Binary data)";
+						break;
+					case 0x06:
+						echo "unsupported BSON type (Undefined)";
+						break;
+					case 0x07:
+						$output[$key] = unpack("H24", $data, $i)[0];
+						$i += 12;
+						break;
+					case 0x07:
+					case 0x08:
+						$value = $data[$i];
+						$i += 1;
+						$output[$key] = ($value == "\x01");
+						break;
+					case 0x09:
+						$i += 8;
+						echo "unsupported BSON type (UTC datetime)";
+						break;
+					case 0x0a:
+						$output[$key] = none;
+						break;
+					case 0x0b:
+						[$pattern, $options] = unpack("Z*Z*", $data, $i);
+						$i += length($pattern) + length($options) + 2;
+						echo "unsupported BSON type (Regular expression)";
+						break;
+					case 0x0c:
+						[$length] = unpack("V", $data, $i);
+						$i += 4 + $length + 12;
+						echo "unsupported BSON type (DBPointer)";
+						break;
+					case 0x0d:
+						[$length] = unpack("V", $data, $i);
+						$i += 4 + $length;
+						echo "unsupported BSON type (JavaScript code)";
+						break;
+					case 0x0e:
+						[$length] = unpack("V", $data, $i);
+						$i += 4 + $length;
+						echo "unsupported BSON type (Symbol)";
+						break;
+					case 0x0f:
+						[$length] = unpack("V", $data, $i);
+						$i += $length;
+						echo "unsupported BSON type (JavaScript code w/ scope)";
+						break;
+					case 0x10: /* int32 */
+						[$v] = unpack("V", $data, $i);
+						$i += 4;
+						$output[$key] = $v;
+						break;
+					case 0x11:
+						$i += 8;
+						echo "unsupported BSON type (Timestamp)";
+						break;
+					case 0x12:
+						$i += 8;
+						echo "unsupported BSON type (64-bit integer)";
+						break;
+					case 0x13:
+						$i += 16;
+						echo "unsupported BSON type (128-bit decimal floating point)";
+						break;
+					case 0xff:
+						echo "unsupported BSON type (Min key)";
+						break;
+					case 0x7f:
+						echo "unsupported BSON type (Max key)";
+						break;
+				}
+			}
+		}
+	}
+
+	private function bson_encode($data)
+	{
+		if (!is_array($data))
+			$data = [];
+
+		$stack = [["k" => array_keys($data), "d" => $data, "i" => 0, "o" => ""]];
+
+		forever
+		{
+			["k" => $k, "d" => $d, "i" => $i, "o" => $o] = $stack[-1:][0];
+
+			if ($i == length($k))
+			{
+				if (length($stack) == 1)
+					return pack("Va*x", 4 + length($stack[0]["o"]) + 1, $stack[0]["o"]);
+
+				$last = $stack[-1:][0];
+				$stack = $stack[:-1];
+				$head = $stack[-1:][0];
+				$head["o"] .= pack("Va*x", 4 + length($last["o"]) + 1, $last["o"]);
+				$stack = $stack[:-1];
+				$stack[] = $head;
+				continue;
+			}
+
+			$break = false;
+			while (!$break and $i < length($k))
+			{
+				$v = $d[$k[$i]];
+
+				if (is_array($v))
+				{
+					$keys = array_keys($v);
+					$type = (length($v) == 0 or is_number($keys[0])) ? 0x04 : 0x03;
+					$stack = $stack[:-1];
+					$stack[] = ["k" => $k, "d" => $d, "i" => $i + 1, "o" => $o . pack("CZ*", $type, $k[$i]) ];
+					$stack[] = ["k" => $keys, "d" => $v, "i" => 0, "o" => ""];
+					$break = true;
+					continue;
+				}
+				else if (is_number($v))
+				{
+					$o .= pack("CZ*e", 0x01, $k[$i], $v);
+				}
+				else if (is_string($v))
+				{
+					$o .= pack("CZ*VZ*", 0x02, $k[$i], length($v) + 1, $v);
+				}
+				else if ($v == none)
+				{
+					$o .= pack("CZ*", 0x0A, $k[$i]);
+				}
+				else
+					return;
+				$i += 1;
+			}
+
+			if ($break)
+				continue;
+
+			$stack = $stack[:-1];
+			$stack[] = ["k" => $k, "d" => $d, "i" => $i, "o" => $o];
+		}
+	}
+}
